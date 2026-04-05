@@ -1,6 +1,6 @@
 FROM python:3.12-slim-bookworm
 
-# Install all Chromium dependencies manually
+# Install ALL Chromium dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 \
     libatk1.0-0 \
@@ -20,6 +20,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcb-dri3-0 \
     libdbus-1-3 \
     libatspi2.0-0 \
+    libxfixes3 \
+    libxext6 \
+    libx11-6 \
+    libxcb1 \
+    libxau6 \
+    libxdmcp6 \
+    libxrender1 \
+    libxi6 \
+    libxtst6 \
+    libglib2.0-0 \
+    libnspr4 \
+    libexpat1 \
     fonts-liberation \
     fonts-unifont \
     xdg-utils \
@@ -28,19 +40,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright Chromium (without --with-deps since we installed deps above)
+# Install Playwright Chromium only (deps already installed above)
 RUN playwright install chromium
 
-# Copy app
 COPY . .
 
-# Railway sets PORT env var automatically
 ENV PORT=5000
 EXPOSE $PORT
 
-# Run with gunicorn
 CMD gunicorn --bind 0.0.0.0:$PORT --timeout 300 --workers 1 app:app
