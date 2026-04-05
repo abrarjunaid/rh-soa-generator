@@ -1,12 +1,29 @@
-FROM python:3.12-slim
+FROM python:3.12-slim-bookworm
 
-# Install system dependencies for Playwright/Chromium
+# Install all Chromium dependencies manually
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
-    libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libgbm1 \
-    libpango-1.0-0 libcairo2 libasound2 libxshmfence1 \
-    libx11-xcb1 libxfixes3 libxext6 libx11-6 libxcb1 \
-    fonts-liberation wget ca-certificates \
+    libnss3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    libgbm1 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libasound2 \
+    libxshmfence1 \
+    libx11-xcb1 \
+    libxcb-dri3-0 \
+    libdbus-1-3 \
+    libatspi2.0-0 \
+    fonts-liberation \
+    fonts-unifont \
+    xdg-utils \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -15,14 +32,15 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright Chromium
-RUN playwright install chromium --with-deps
+# Install Playwright Chromium (without --with-deps since we installed deps above)
+RUN playwright install chromium
 
 # Copy app
 COPY . .
 
 # Railway sets PORT env var automatically
 ENV PORT=5000
+EXPOSE $PORT
 
-# Run with gunicorn - bind to 0.0.0.0 on Railway's PORT
-CMD gunicorn --bind 0.0.0.0:$PORT --timeout 300 --workers 2 app:app
+# Run with gunicorn
+CMD gunicorn --bind 0.0.0.0:$PORT --timeout 300 --workers 1 app:app
