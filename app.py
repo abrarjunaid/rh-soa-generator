@@ -99,52 +99,91 @@ def load_unit_registry(wb):
 
 
 def get_available_months(wb, units):
+    """Get available months from the Sales sheet (works with formula-based P&L)."""
     months_set = set()
-    for unit in units:
-        try:
-            ws = wb[unit["code"]]
-        except KeyError:
-            continue
-        for col in range(2, ws.max_column + 1):
-            cell_val = ws.cell(row=3, column=col).value
-            if isinstance(cell_val, datetime):
-                months_set.add(month_key(cell_val))
+    unit_codes = {u["code"] for u in units}
+    ws = wb["Sales"]
+    header_row = None
+    for r in range(1, 6):
+        val = ws.cell(row=r, column=1).value
+        if val and "Hostaway" in str(val):
+            header_row = r
+            break
+    if header_row is None:
+        return []
+    for row in ws.iter_rows(min_row=header_row + 1, max_row=ws.max_row, values_only=False):
+        prop = str(row[3].value or "").strip()
+        sm = row[7].value
+        if prop in unit_codes and isinstance(sm, datetime):
+            months_set.add(month_key(sm))
     return sorted(months_set, reverse=True)
 
 
-def load_pnl(wb, unit_code, month):
-    try:
-        ws = wb[unit_code]
-    except KeyError:
+def load_expenses(wb, unit_code, month):
+    """Compute owner expenses from Expenses sheet using P&L SUMIFS logic."""
+    ws = wb["Expenses"]
+    y, m = month.split("-")
+    target_year, target_month = int(y), int(m)
+    utilities = 0.0
+    setup_cost = 0.0
+    for r in range(4, ws.max_row + 1):
+        cc = str(ws.cell(row=r, column=15).value or "").strip()
+        subcat = str(ws.cell(row=r, column=16).value or "").strip()
+        ac_cat = str(ws.cell(row=r, column=17).value or "").strip()
+        svc_month = ws.cell(row=r, column=3).value
+        exp_date = ws.cell(row=r, column=1).value
+        amount = float(ws.cell(row=r, column=6).value or 0)
+        if cc != unit_code:
+            continue
+        if (subcat == "Utilities" and
+            ac_cat not in ("Apartment Startup Cost", "Business Startup Cost") and
+            isinstance(svc_month, datetime) and
+            svc_month.year == target_year and svc_month.month == target_month):
+            utilities += amount
+        if (ac_cat == "Apartment Startup Cost" and
+            isinstance(exp_date, datetime) and
+            exp_date.year == target_year and exp_date.month == target_month):
+            setup_cost += amount
+    return round(utilities, 2), round(setup_cost, 2)
+
+
+def load_pnl(wb, unit_code, month, bookings=None):
+    """Compute P&L from raw Sales + Expenses data (no formula dependency)."""
+    if bookings is None:
+        bookings = load_bookings(wb, unit_code, month)
+    if not bookings:
         return None
 
-    col_idx = None
-    for col in range(2, ws.max_column + 1):
-        cell_val = ws.cell(row=3, column=col).value
-        if isinstance(cell_val, datetime) and month_key(cell_val) == month:
-            col_idx = col
-            break
+    utilities, setup_cost = load_expenses(wb, unit_code, month)
 
-    if col_idx is None:
+    total_gross = round(sum(b["guest_paid"] for b in bookings), 2)
+    platform_fees = round(sum(b["host_fee_total"] for b in bookings), 2)
+    payment_charges = round(sum(b["payment_charges"] for b in bookings), 2)
+    net_earned = round(sum(b["remitted"] for b in bookings), 2)
+    cleaning_retained = round(sum(b["cleaning"] for b in bookings), 2)
+    tourism_retained = round(sum(b["tourism"] for b in bookings), 2)
+    rev_net_retained = round(net_earned - cleaning_retained - tourism_retained, 2)
+    total_owner_expenses = round(utilities + setup_cost, 2)
+    net_before_mgmt = round(rev_net_retained - total_owner_expenses, 2)
+    mgmt_fee = round(rev_net_retained * 0.15, 2)
+    owner_payout = round(net_before_mgmt - mgmt_fee, 2)
+
+    if total_gross == 0:
         return None
 
-    def v(row_num):
-        val = ws.cell(row=row_num, column=col_idx).value
-        return round(float(val), 2) if isinstance(val, (int, float)) else 0.0
-
-    pnl = {
-        "total_gross": v(15), "platform_fees": v(16), "payment_charges": v(17),
-        "net_earned": v(19), "cleaning_retained": v(21), "tourism_retained": v(22),
-        "rev_net_retained": v(23), "total_owner_expenses": v(28),
-        "net_before_mgmt": v(29), "mgmt_fee": v(30), "owner_payout": v(31),
+    return {
+        "total_gross": total_gross, "platform_fees": platform_fees,
+        "payment_charges": payment_charges, "net_earned": net_earned,
+        "cleaning_retained": -cleaning_retained, "tourism_retained": -tourism_retained,
+        "rev_net_retained": rev_net_retained,
+        "total_owner_expenses": -total_owner_expenses,
+        "net_before_mgmt": net_before_mgmt,
+        "mgmt_fee": -mgmt_fee, "owner_payout": owner_payout,
     }
-
-    if pnl["owner_payout"] == 0 and pnl["total_gross"] == 0:
-        return None
-    return pnl
 
 
 def load_bookings(wb, unit_code, month):
+    """Extract bookings from Sales, computing formula columns from raw data."""
     ws = wb["Sales"]
     header_row = None
     for r in range(1, 6):
@@ -159,22 +198,40 @@ def load_bookings(wb, unit_code, month):
     for row in ws.iter_rows(min_row=header_row + 1, max_row=ws.max_row, values_only=False):
         prop = row[3].value
         sale_month = row[7].value
-        if (str(prop).strip() == unit_code and
-                isinstance(sale_month, datetime) and
-                month_key(sale_month) == month):
-            bookings.append({
-                "guest": str(row[2].value or ""),
-                "platform": str(row[6].value or ""),
-                "checkin": row[8].value,
-                "checkout": row[9].value,
-                "nights": int(row[10].value or 0),
-                "cleaning": round(float(row[13].value or 0), 2),
-                "tourism": round(float(row[15].value or 0), 2),
-                "guest_paid": round(float(row[22].value or 0), 2),
-                "host_fee_total": round(float(row[25].value or 0), 2),
-                "payment_charges": round(float(row[26].value or 0), 2),
-                "remitted": round(float(row[31].value or 0), 2),
-            })
+        if (str(prop).strip() != unit_code or
+            not isinstance(sale_month, datetime) or
+            month_key(sale_month) != month):
+            continue
+
+        # Raw input columns (M through V + AK)
+        m_to_v = sum(float(row[c].value or 0) for c in range(12, 22))
+        ak = float(row[36].value or 0) if len(row) > 36 else 0
+
+        # Computed: GuestPaid = SUM(M:V) + AK
+        guest_paid = round(m_to_v + ak, 2)
+
+        # Direct values
+        host_fee_total = float(row[25].value or 0)   # Z
+        pg_fees_total = float(row[28].value or 0)    # AC
+        refunds = float(row[29].value or 0)          # AD
+        other_receipt = float(row[30].value or 0)     # AE
+
+        # Computed: Remitted = GuestPaid + HostFee + PGFees - Refunds + OtherReceipt
+        remitted = round(guest_paid + host_fee_total + pg_fees_total - refunds + other_receipt, 2)
+
+        bookings.append({
+            "guest": str(row[2].value or ""),
+            "platform": str(row[6].value or ""),
+            "checkin": row[8].value,
+            "checkout": row[9].value,
+            "nights": int(row[10].value or 0),
+            "cleaning": round(float(row[13].value or 0), 2),
+            "tourism": round(float(row[15].value or 0), 2),
+            "guest_paid": guest_paid,
+            "host_fee_total": host_fee_total,
+            "payment_charges": pg_fees_total,
+            "remitted": remitted,
+        })
     return bookings
 
 
@@ -454,14 +511,14 @@ def generate():
                         results.append({"code": code, "status": "error", "msg": "Unit not found"})
                         continue
 
-                    pnl = load_pnl(wb, code, month)
-                    if not pnl:
-                        results.append({"code": code, "status": "skip", "msg": "No P&L data"})
-                        continue
-
                     bookings = load_bookings(wb, code, month)
                     if not bookings:
                         results.append({"code": code, "status": "skip", "msg": "No bookings"})
+                        continue
+
+                    pnl = load_pnl(wb, code, month, bookings)
+                    if not pnl:
+                        results.append({"code": code, "status": "skip", "msg": "No P&L data"})
                         continue
 
                     soa = calculate_soa(unit, pnl, bookings, month)
