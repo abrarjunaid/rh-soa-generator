@@ -99,23 +99,17 @@ def load_unit_registry(wb):
 
 
 def get_available_months(wb, units):
-    """Get available months from the Sales sheet (works with formula-based P&L)."""
+    """Get available months from P&L sheet headers (row 3 date columns)."""
     months_set = set()
-    unit_codes = {u["code"] for u in units}
-    ws = wb["Sales"]
-    header_row = None
-    for r in range(1, 6):
-        val = ws.cell(row=r, column=1).value
-        if val and "Hostaway" in str(val):
-            header_row = r
-            break
-    if header_row is None:
-        return []
-    for row in ws.iter_rows(min_row=header_row + 1, max_row=ws.max_row, values_only=False):
-        prop = str(row[3].value or "").strip()
-        sm = row[7].value
-        if prop in unit_codes and isinstance(sm, datetime):
-            months_set.add(month_key(sm))
+    for unit in units:
+        try:
+            ws = wb[unit["code"]]
+        except KeyError:
+            continue
+        for col in range(2, ws.max_column + 1):
+            cell_val = ws.cell(row=3, column=col).value
+            if isinstance(cell_val, datetime):
+                months_set.add(month_key(cell_val))
     return sorted(months_set, reverse=True)
 
 
@@ -194,6 +188,14 @@ def load_bookings(wb, unit_code, month):
     if header_row is None:
         return []
 
+    # Find the "Other Fees (HA)" column dynamically (may not exist in all workbooks)
+    ak_col = None
+    for c in range(1, ws.max_column + 1):
+        h = ws.cell(row=header_row, column=c).value
+        if h and "Other Fees" in str(h):
+            ak_col = c - 1  # 0-indexed for row[] access
+            break
+
     bookings = []
     for row in ws.iter_rows(min_row=header_row + 1, max_row=ws.max_row, values_only=False):
         prop = row[3].value
@@ -203,18 +205,30 @@ def load_bookings(wb, unit_code, month):
             month_key(sale_month) != month):
             continue
 
-        # Raw input columns (M through V + AK)
-        m_to_v = sum(float(row[c].value or 0) for c in range(12, 22))
-        ak = float(row[36].value or 0) if len(row) > 36 else 0
+        # Safe float helper
+        def sf(val):
+            if val is None:
+                return 0.0
+            if isinstance(val, (int, float)):
+                return float(val)
+            return 0.0
+
+        # Raw input columns (M through V)
+        m_to_v = sum(sf(row[c].value) for c in range(12, 22))
+
+        # Other Fees (HA) - only if column exists and value is numeric
+        ak = 0
+        if ak_col is not None and ak_col < len(row):
+            ak = sf(row[ak_col].value)
 
         # Computed: GuestPaid = SUM(M:V) + AK
         guest_paid = round(m_to_v + ak, 2)
 
         # Direct values
-        host_fee_total = float(row[25].value or 0)   # Z
-        pg_fees_total = float(row[28].value or 0)    # AC
-        refunds = float(row[29].value or 0)          # AD
-        other_receipt = float(row[30].value or 0)     # AE
+        host_fee_total = sf(row[25].value)   # Z
+        pg_fees_total = sf(row[28].value)    # AC
+        refunds = sf(row[29].value)          # AD
+        other_receipt = sf(row[30].value)     # AE
 
         # Computed: Remitted = GuestPaid + HostFee + PGFees - Refunds + OtherReceipt
         remitted = round(guest_paid + host_fee_total + pg_fees_total - refunds + other_receipt, 2)
@@ -224,9 +238,9 @@ def load_bookings(wb, unit_code, month):
             "platform": str(row[6].value or ""),
             "checkin": row[8].value,
             "checkout": row[9].value,
-            "nights": int(row[10].value or 0),
-            "cleaning": round(float(row[13].value or 0), 2),
-            "tourism": round(float(row[15].value or 0), 2),
+            "nights": int(sf(row[10].value)),
+            "cleaning": round(sf(row[13].value), 2),
+            "tourism": round(sf(row[15].value), 2),
             "guest_paid": guest_paid,
             "host_fee_total": host_fee_total,
             "payment_charges": pg_fees_total,
