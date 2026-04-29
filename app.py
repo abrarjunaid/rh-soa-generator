@@ -119,6 +119,14 @@ def get_available_months(wb, units):
     return sorted(months_set, reverse=True)
 
 
+def safe_float(value, default=0.0):
+    """Safely convert a cell value to float, returning default on failure."""
+    try:
+        return float(value or default)
+    except (ValueError, TypeError):
+        return default
+
+
 def load_expenses(wb, unit_code, month):
     """Compute owner expenses from Expenses sheet using P&L SUMIFS logic."""
     ws = wb["Expenses"]
@@ -134,10 +142,7 @@ def load_expenses(wb, unit_code, month):
         ac_cat = str(ws.cell(row=r, column=17).value or "").strip()
         svc_month = ws.cell(row=r, column=3).value
         exp_date = ws.cell(row=r, column=1).value
-        try:
-            amount = float(ws.cell(row=r, column=6).value or 0)
-        except (ValueError, TypeError):
-            amount = 0.0
+        amount = safe_float(ws.cell(row=r, column=6).value)
         if (subcat == "Utilities" and
             ac_cat not in ("Apartment Startup Cost", "Business Startup Cost") and
             isinstance(svc_month, datetime) and
@@ -212,17 +217,17 @@ def load_bookings(wb, unit_code, month):
             continue
 
         # Raw input columns (M through V + AK)
-        m_to_v = sum(float(row[c].value or 0) for c in range(12, 22))
-        ak = float(row[36].value or 0) if len(row) > 36 else 0
+        m_to_v = sum(safe_float(row[c].value) for c in range(12, 22))
+        ak = safe_float(row[36].value) if len(row) > 36 else 0
 
         # Computed: GuestPaid = SUM(M:V) + AK
         guest_paid = round(m_to_v + ak, 2)
 
         # Direct values
-        host_fee_total = float(row[25].value or 0)   # Z
-        pg_fees_total = float(row[28].value or 0)    # AC
-        refunds = float(row[29].value or 0)          # AD
-        other_receipt = float(row[30].value or 0)     # AE
+        host_fee_total = safe_float(row[25].value)   # Z
+        pg_fees_total = safe_float(row[28].value)    # AC
+        refunds = safe_float(row[29].value)          # AD
+        other_receipt = safe_float(row[30].value)    # AE
 
         # Computed: Remitted = GuestPaid + HostFee + PGFees - Refunds + OtherReceipt
         remitted = round(guest_paid + host_fee_total + pg_fees_total - refunds + other_receipt, 2)
@@ -233,8 +238,8 @@ def load_bookings(wb, unit_code, month):
             "checkin": row[8].value,
             "checkout": row[9].value,
             "nights": int(row[10].value or 0),
-            "cleaning": round(float(row[13].value or 0), 2),
-            "tourism": round(float(row[15].value or 0), 2),
+            "cleaning": round(safe_float(row[13].value), 2),
+            "tourism": round(safe_float(row[15].value), 2),
             "guest_paid": guest_paid,
             "host_fee_total": host_fee_total,
             "payment_charges": pg_fees_total,
