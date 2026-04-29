@@ -128,13 +128,16 @@ def load_expenses(wb, unit_code, month):
     reimbursement = 0.0
     for r in range(4, ws.max_row + 1):
         cc = str(ws.cell(row=r, column=15).value or "").strip()
+        if cc != unit_code:
+            continue
         subcat = str(ws.cell(row=r, column=16).value or "").strip()
         ac_cat = str(ws.cell(row=r, column=17).value or "").strip()
         svc_month = ws.cell(row=r, column=3).value
         exp_date = ws.cell(row=r, column=1).value
-        amount = float(ws.cell(row=r, column=6).value or 0)
-        if cc != unit_code:
-            continue
+        try:
+            amount = float(ws.cell(row=r, column=6).value or 0)
+        except (ValueError, TypeError):
+            amount = 0.0
         if (subcat == "Utilities" and
             ac_cat not in ("Apartment Startup Cost", "Business Startup Cost") and
             isinstance(svc_month, datetime) and
