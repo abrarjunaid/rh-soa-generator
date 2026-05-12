@@ -153,7 +153,7 @@ def load_expenses(wb, unit_code, month):
         def in_month(d):
             return isinstance(d, datetime) and d.year == target_year and d.month == target_month
 
-        if (subcat in ("Utilities", "Service Charges - Apartments") and
+        if (subcat == "Utilities" and
             ac_cat not in ("Apartment Startup Cost", "Business Startup Cost") and
             in_month(svc_month)):
             utilities += amount
