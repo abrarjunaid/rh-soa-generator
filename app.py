@@ -230,7 +230,9 @@ def load_bookings(wb, unit_code, month):
         guest_paid = round(m_to_v + ak, 2)
 
         # Direct values
-        host_fee_total = safe_float(row[25].value)   # Z
+        host_fee_z = safe_float(row[25].value)       # Z  – Airbnb/Booking.com host fee (negative)
+        bg_fee_af  = safe_float(row[31].value) if len(row) > 31 else 0.0  # AF – Blueground/Partner commission (negative)
+        host_fee_total = round(host_fee_z + bg_fee_af, 2)  # combined platform fee
         pg_fees_total = safe_float(row[28].value)    # AC
         refunds = safe_float(row[29].value)          # AD
         other_receipt = safe_float(row[30].value)    # AE
