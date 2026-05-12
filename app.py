@@ -165,29 +165,96 @@ def load_expenses(wb, unit_code, month):
     return round(utilities, 2), round(reimbursement, 2)
 
 
+def read_unit_pnl_sheet(wb, unit_code, month):
+    """Read key financial rows directly from the unit's own P&L worksheet.
+
+    The workbook contains one sheet per unit (e.g. "AC 1303") with a
+    standardised row layout.  Reading from there means hardcoded cells
+    (e.g. manually overridden utilities) are honoured automatically —
+    the same value Excel shows is what the SOA uses.
+
+    Row layout assumed (1-indexed):
+      3  = month header dates (first-of-month)
+      26 = Less: Utilities & Service Charge  (negative)
+      27 = Less: Reimbursement Cost          (negative)
+      30 = Less: Management Fee              (negative)
+      31 = Owner Payout
+
+    Returns a dict or None if the sheet / month column cannot be found.
+    """
+    if unit_code not in wb.sheetnames:
+        return None
+
+    ws = wb[unit_code]
+    y, m_str = month.split("-")
+    target_year, target_month = int(y), int(m_str)
+
+    # Scan row 3 for the column whose date matches the target month
+    target_col = None
+    for col in range(1, min(ws.max_column + 1, 60)):
+        cell_val = ws.cell(row=3, column=col).value
+        if (isinstance(cell_val, datetime) and
+                cell_val.year == target_year and
+                cell_val.month == target_month):
+            target_col = col
+            break
+
+    if target_col is None:
+        return None
+
+    def v(row):
+        return safe_float(ws.cell(row=row, column=target_col).value)
+
+    return {
+        "utilities":     abs(v(26)),   # stored negative in sheet
+        "reimbursement": abs(v(27)),   # stored negative in sheet
+        "mgmt_fee":      v(30),        # negative  e.g. -1053.16
+        "owner_payout":  v(31),        # positive (can be negative if owner owes)
+    }
+
+
 def load_pnl(wb, unit_code, month, bookings=None, mgmt_pct=0.15):
-    """Compute P&L from raw Sales + Expenses data (no formula dependency)."""
+    """Compute P&L figures for the SOA.
+
+    Revenue & fee totals are derived from the Sales bookings so the
+    per-booking table stays consistent.  Utilities, reimbursement, mgmt
+    fee and owner payout are read directly from the unit's P&L sheet
+    when available — this respects any hardcoded values the accountant
+    has set.  If the sheet is absent we fall back to computing from the
+    Expenses sheet.
+    """
     if bookings is None:
         bookings = load_bookings(wb, unit_code, month)
     if not bookings:
         return None
 
-    utilities, reimbursement = load_expenses(wb, unit_code, month)
-
     total_gross = round(sum(b["guest_paid"] for b in bookings), 2)
-    platform_fees = round(sum(b["host_fee_total"] for b in bookings), 2)
-    payment_charges = round(sum(b["payment_charges"] for b in bookings), 2)
-    net_earned = round(sum(b["remitted"] for b in bookings), 2)
-    cleaning_retained = round(sum(b["cleaning"] for b in bookings), 2)
-    tourism_retained = round(sum(b["tourism"] for b in bookings), 2)
-    rev_net_retained = round(net_earned - cleaning_retained - tourism_retained, 2)
-    total_owner_expenses = round(utilities + reimbursement, 2)
-    net_before_mgmt = round(rev_net_retained - total_owner_expenses, 2)
-    mgmt_fee = round(rev_net_retained * mgmt_pct, 2)
-    owner_payout = round(net_before_mgmt - mgmt_fee, 2)
-
     if total_gross == 0:
         return None
+
+    platform_fees    = round(sum(b["host_fee_total"]    for b in bookings), 2)
+    payment_charges  = round(sum(b["payment_charges"]   for b in bookings), 2)
+    net_earned       = round(sum(b["remitted"]          for b in bookings), 2)
+    cleaning_retained = round(sum(b["cleaning"]         for b in bookings), 2)
+    tourism_retained  = round(sum(b["tourism"]          for b in bookings), 2)
+    rev_net_retained  = round(net_earned - cleaning_retained - tourism_retained, 2)
+
+    # ── Primary: read expenses & payout directly from the unit's P&L sheet ──
+    pnl_sheet = read_unit_pnl_sheet(wb, unit_code, month)
+    if pnl_sheet:
+        utilities     = pnl_sheet["utilities"]
+        reimbursement = pnl_sheet["reimbursement"]
+        mgmt_fee      = abs(pnl_sheet["mgmt_fee"])
+        owner_payout  = pnl_sheet["owner_payout"]
+    else:
+        # ── Fallback: compute from Expenses sheet ────────────────────────────
+        utilities, reimbursement = load_expenses(wb, unit_code, month)
+        mgmt_fee     = round(rev_net_retained * mgmt_pct, 2)
+        net_b4_mgmt  = round(rev_net_retained - (utilities + reimbursement), 2)
+        owner_payout = round(net_b4_mgmt - mgmt_fee, 2)
+
+    total_owner_expenses = round(utilities + reimbursement, 2)
+    net_before_mgmt      = round(rev_net_retained - total_owner_expenses, 2)
 
     return {
         "total_gross": total_gross, "platform_fees": platform_fees,
