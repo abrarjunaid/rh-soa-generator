@@ -87,6 +87,11 @@ def load_unit_registry(wb):
             continue
         if str(code).strip() == "Unit Code":
             continue
+        raw_pct = str(row[4].value or "15%").strip().replace("%", "")
+        try:
+            mgmt_pct = float(raw_pct) / 100
+        except (ValueError, TypeError):
+            mgmt_pct = 0.15
         units.append({
             "code": str(code).strip(),
             "building": str(building).strip(),
@@ -94,6 +99,7 @@ def load_unit_registry(wb):
             "email": str(row[7].value or "[Email]").strip(),
             "phone": str(row[8].value or "[Phone]").strip(),
             "active": str(row[10].value or "").strip(),
+            "mgmt_pct": mgmt_pct,
         })
     return units
 
@@ -159,7 +165,7 @@ def load_expenses(wb, unit_code, month):
     return round(utilities, 2), round(reimbursement, 2)
 
 
-def load_pnl(wb, unit_code, month, bookings=None):
+def load_pnl(wb, unit_code, month, bookings=None, mgmt_pct=0.15):
     """Compute P&L from raw Sales + Expenses data (no formula dependency)."""
     if bookings is None:
         bookings = load_bookings(wb, unit_code, month)
@@ -177,7 +183,7 @@ def load_pnl(wb, unit_code, month, bookings=None):
     rev_net_retained = round(net_earned - cleaning_retained - tourism_retained, 2)
     total_owner_expenses = round(utilities + reimbursement, 2)
     net_before_mgmt = round(rev_net_retained - total_owner_expenses, 2)
-    mgmt_fee = round(rev_net_retained * 0.15, 2)
+    mgmt_fee = round(rev_net_retained * mgmt_pct, 2)
     owner_payout = round(net_before_mgmt - mgmt_fee, 2)
 
     if total_gross == 0:
@@ -253,17 +259,17 @@ def load_bookings(wb, unit_code, month):
 def calculate_soa(unit, pnl, bookings, month):
     running_pm = 0.0
     rows = []
+    mgmt_pct = unit.get("mgmt_pct", 0.15)
 
     for i, b in enumerate(bookings):
         rev = b["guest_paid"]
         cleaning = b["cleaning"]
         tourism = b["tourism"]
         commission = round(abs(b["host_fee_total"]) + abs(b["payment_charges"]), 2)
-        net = b["remitted"]
-        rev_net_ret = net - cleaning - tourism
-        pm = round(rev_net_ret * 0.15, 2)
+        net = round(b["remitted"] - cleaning - tourism, 2)
+        pm = round(net * mgmt_pct, 2)
         running_pm += pm
-        gross = round(rev_net_ret - pm, 2)
+        gross = round(net - pm, 2)
 
         ch_class, ch_label = "ch-direct", "Direct"
         plat = b["platform"].lower()
@@ -318,6 +324,7 @@ def calculate_soa(unit, pnl, bookings, month):
             "net_payout": round(pnl["owner_payout"]),
             "net_payout_exact": round(pnl["owner_payout"], 2),
         },
+        "mgmt_pct": mgmt_pct,
     }
 
 
@@ -336,6 +343,9 @@ def generate_html(soa, logo_b64=None):
 
     actual_logo = logo_b64 if logo_b64 else RADIANT_LOGO_B64
     logo = f'<img src="data:image/png;base64,{actual_logo}" style="height:36px;width:auto">'
+
+    mgmt_pct = soa.get("mgmt_pct", 0.15)
+    mgmt_pct_label = f"{int(mgmt_pct * 100)}%" if mgmt_pct * 100 == int(mgmt_pct * 100) else f"{mgmt_pct * 100:.1f}%"
 
     reimb_row = (
         f'<div style="display:flex;justify-content:space-between;padding:6px 0;font-size:12px">'
@@ -379,14 +389,14 @@ tfoot td{{padding:12px 6px;font-weight:700;border-top:2px solid #1565a0;backgrou
 <div style="border:1.5px solid #dde3ea;border-radius:12px;padding:20px;text-align:center;position:relative"><div style="position:absolute;top:0;left:28%;right:28%;height:3px;border-radius:0 0 3px 3px;background:#d94f4f"></div><div style="font-size:26px;font-weight:700;color:#d94f4f;margin-bottom:4px;letter-spacing:-.5px">{k["reservations"]}</div><div style="font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:#6b7280;font-weight:500">Reservations</div></div>
 </div>
 <div style="font-size:9px;font-weight:700;letter-spacing:3px;text-transform:uppercase;color:#1565a0;padding:14px 44px 10px;display:flex;align-items:center;gap:14px">Rental Activity Details — {ms[int(mn)]} {y}<span style="flex:1;height:1px;background:#dde3ea"></span></div>
-<div style="padding:0 44px 12px"><table><thead><tr><th>#</th><th>Guest</th><th>Channel</th><th>In</th><th>Out</th><th class="r">Nts</th><th class="r">Booking Rev</th><th class="r">Cleaning</th><th class="r">Commission</th><th class="r">Net Rev</th><th class="r">PM 15%</th><th class="r">Gross</th></tr></thead><tbody>{brows}</tbody>
+<div style="padding:0 44px 12px"><table><thead><tr><th>#</th><th>Guest</th><th>Channel</th><th>In</th><th>Out</th><th class="r">Nts</th><th class="r">Booking Rev</th><th class="r">Cleaning</th><th class="r">Commission</th><th class="r">Net Rev</th><th class="r">PM {mgmt_pct_label}</th><th class="r">Gross</th></tr></thead><tbody>{brows}</tbody>
 <tfoot><tr><td colspan="5">Total</td><td class="r">{t["nights"]}</td><td class="r">{fmt(t["rev"])}</td><td class="r">{fmt(t["cleaning"])}</td><td class="r">{fmt(t["commission"])}</td><td class="r">{fmt(t["net"])}</td><td class="r">{fmt(t["pm"])}</td><td class="r">{fmt(t["gross"])}</td></tr></tfoot></table></div>
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;padding:0 44px 18px">
 <div style="border:1.5px solid #dde3ea;border-radius:12px;padding:22px"><div style="font-size:9px;letter-spacing:2.5px;text-transform:uppercase;color:#1565a0;font-weight:700;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid #dde3ea">Expenses & Extras</div><div style="display:flex;justify-content:space-between;padding:6px 0;font-size:12px"><span style="color:#6b7280">Utilities & Service Charge — {month_short(m)}</span><span style="font-weight:500;font-variant-numeric:tabular-nums">{fmt(d["utilities"])}</span></div>{reimb_row}<div style="display:flex;justify-content:space-between;padding:10px 0 6px;font-size:12px;font-weight:700;border-top:1.5px solid #1a1d24;margin-top:8px"><span>Total Expenses</span><span style="color:#d94f4f;font-variant-numeric:tabular-nums">AED {fmt(soa["expenses"])}</span></div></div>
 <div style="border:1.5px solid #dde3ea;border-radius:12px;padding:22px"><div style="font-size:9px;letter-spacing:2.5px;text-transform:uppercase;color:#1565a0;font-weight:700;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid #dde3ea">Deductions Breakdown</div>
 <div style="display:flex;justify-content:space-between;padding:6px 0;font-size:12px"><span style="color:#6b7280">Fees Received (Cleaning + Tourism)</span><span style="font-weight:500;font-variant-numeric:tabular-nums">{fmt(d["fees_received"])}</span></div>
 <div style="display:flex;justify-content:space-between;padding:6px 0;font-size:12px"><span style="color:#6b7280">Utilities & Service Charge</span><span style="font-weight:500;font-variant-numeric:tabular-nums">{fmt(d["utilities"])}</span></div>{reimb_row}
-<div style="display:flex;justify-content:space-between;padding:6px 0;font-size:12px"><span style="color:#6b7280">Management Fee (15%)</span><span style="font-weight:500;font-variant-numeric:tabular-nums">{fmt(d["mgmt_fee"])}</span></div>
+<div style="display:flex;justify-content:space-between;padding:6px 0;font-size:12px"><span style="color:#6b7280">Management Fee ({mgmt_pct_label})</span><span style="font-weight:500;font-variant-numeric:tabular-nums">{fmt(d["mgmt_fee"])}</span></div>
 <div style="display:flex;justify-content:space-between;padding:6px 0;font-size:12px"><span style="color:#6b7280">Platform Host Fees</span><span style="font-weight:500;font-variant-numeric:tabular-nums">{fmt(d["platform_fees"])}</span></div>
 <div style="display:flex;justify-content:space-between;padding:6px 0;font-size:12px"><span style="color:#6b7280">Payment Charges</span><span style="font-weight:500;font-variant-numeric:tabular-nums">{fmt(d["payment_charges"])}</span></div>
 <div style="display:flex;justify-content:space-between;padding:10px 0 6px;font-size:12px;font-weight:700;border-top:1.5px solid #1a1d24;margin-top:8px"><span>Total Deductions</span><span style="color:#d94f4f;font-variant-numeric:tabular-nums">AED {fmt(d["total"])}</span></div>
@@ -398,7 +408,7 @@ tfoot td{{padding:12px 6px;font-weight:700;border-top:2px solid #1565a0;backgrou
 <div style="display:flex;gap:10px;margin-bottom:7px;font-size:11px;line-height:1.6;color:#6b7280"><span style="color:#1565a0;font-weight:700;min-width:16px">1.</span><div><strong style="color:#1a1d24;font-weight:500">Booking Revenue:</strong> Total amount collected from the guest including accommodation, cleaning, tourism, VAT, and other fees.</div></div>
 <div style="display:flex;gap:10px;margin-bottom:7px;font-size:11px;line-height:1.6;color:#6b7280"><span style="color:#1565a0;font-weight:700;min-width:16px">2.</span><div><strong style="color:#1a1d24;font-weight:500">Commission:</strong> Platform host fees (Airbnb, Booking.com) and payment processing charges.</div></div>
 <div style="display:flex;gap:10px;margin-bottom:7px;font-size:11px;line-height:1.6;color:#6b7280"><span style="color:#1565a0;font-weight:700;min-width:16px">3.</span><div><strong style="color:#1a1d24;font-weight:500">Net Revenue:</strong> Amount remitted to Radiant Homes after platform and payment deductions.</div></div>
-<div style="display:flex;gap:10px;margin-bottom:7px;font-size:11px;line-height:1.6;color:#6b7280"><span style="color:#1565a0;font-weight:700;min-width:16px">4.</span><div><strong style="color:#1a1d24;font-weight:500">PM 15%:</strong> Property Management Commission calculated at 15% of revenue net of retained fees.</div></div>
+<div style="display:flex;gap:10px;margin-bottom:7px;font-size:11px;line-height:1.6;color:#6b7280"><span style="color:#1565a0;font-weight:700;min-width:16px">4.</span><div><strong style="color:#1a1d24;font-weight:500">PM {mgmt_pct_label}:</strong> Property Management Commission calculated at {mgmt_pct_label} of revenue net of retained fees.</div></div>
 <div style="display:flex;gap:10px;margin-bottom:7px;font-size:11px;line-height:1.6;color:#6b7280"><span style="color:#1565a0;font-weight:700;min-width:16px">5.</span><div><strong style="color:#1a1d24;font-weight:500">Owner Gross:</strong> Amount before operational expenses. Owner Gross less Expenses equals Net Owner Payout.</div></div>
 </div>
 <div style="padding:18px 44px;border-top:1px solid #dde3ea;display:flex;justify-content:space-between;font-size:10px;color:#6b7280"><span>Radiant Vacation Homes Rental L.L.C</span><span>3503, Aspect Tower, Business Bay, UAE</span></div>
@@ -539,7 +549,7 @@ def generate():
                         results.append({"code": code, "status": "skip", "msg": "No bookings"})
                         continue
 
-                    pnl = load_pnl(wb, code, month, bookings)
+                    pnl = load_pnl(wb, code, month, bookings, mgmt_pct=unit.get("mgmt_pct", 0.15))
                     if not pnl:
                         results.append({"code": code, "status": "skip", "msg": "No P&L data"})
                         continue
