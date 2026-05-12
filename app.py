@@ -149,18 +149,18 @@ def load_expenses(wb, unit_code, month):
         svc_month = ws.cell(row=r, column=3).value
         exp_date = ws.cell(row=r, column=1).value
         amount = safe_float(ws.cell(row=r, column=6).value)
-        if (subcat == "Utilities" and
+        # Helper: check if either svc_month or exp_date falls in target month
+        def in_month(d):
+            return isinstance(d, datetime) and d.year == target_year and d.month == target_month
+
+        if (subcat in ("Utilities", "Service Charges - Apartments") and
             ac_cat not in ("Apartment Startup Cost", "Business Startup Cost") and
-            isinstance(svc_month, datetime) and
-            svc_month.year == target_year and svc_month.month == target_month):
+            in_month(svc_month)):
             utilities += amount
-        if (ac_cat == "Apartment Startup Cost" and
-            isinstance(exp_date, datetime) and
-            exp_date.year == target_year and exp_date.month == target_month):
+        if (ac_cat == "Apartment Startup Cost" and in_month(exp_date)):
             reimbursement += amount
         if (subcat == "Reimbursement" and
-            isinstance(exp_date, datetime) and
-            exp_date.year == target_year and exp_date.month == target_month):
+            (in_month(exp_date) or in_month(svc_month))):
             reimbursement += amount
     return round(utilities, 2), round(reimbursement, 2)
 
