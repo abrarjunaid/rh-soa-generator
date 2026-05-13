@@ -165,27 +165,42 @@ def load_expenses(wb, unit_code, month):
     return round(utilities, 2), round(reimbursement, 2)
 
 
-def read_unit_pnl_sheet(wb, unit_code, month):
+def read_unit_pnl_sheet(wb, wb_raw, unit_code, month):
     """Read key financial rows directly from the unit's own P&L worksheet.
 
     The workbook contains one sheet per unit (e.g. "AC 1303") with a
-    standardised row layout.  Reading from there means hardcoded cells
-    (e.g. manually overridden utilities) are honoured automatically —
-    the same value Excel shows is what the SOA uses.
+    standardised row layout.
 
-    Row layout assumed (1-indexed):
+    Strategy — formula vs literal detection
+    ----------------------------------------
+    wb       is loaded with data_only=True  → gives cached formula results
+    wb_raw   is loaded with data_only=False → gives the actual cell content
+             (a formula string like "=SUMIFS(...)" or a literal number)
+
+    For each key cell we check wb_raw first:
+      • If the cell contains a formula (value starts with "=")
+        → return None so load_pnl will compute the value from raw booking /
+          expense data.  This makes the SOA immune to the workbook being
+          saved without Excel recalculating.
+      • If the cell contains a literal value (hardcoded by the accountant)
+        → return that value.  The accountant's intentional override is
+          honoured regardless of how the workbook was saved.
+
+    Row layout (1-indexed):
       3  = month header dates (first-of-month)
-      26 = Less: Utilities & Service Charge  (negative)
-      27 = Less: Reimbursement Cost          (negative)
-      30 = Less: Management Fee              (negative)
-      31 = Owner Payout
+      26 = Less: Utilities & Service Charge  (negative literal expected)
+      27 = Less: Reimbursement Cost          (negative literal or formula)
+      30 = Less: Management Fee              (formula → always None here)
+      31 = Owner Payout                      (formula → always None here)
 
     Returns a dict or None if the sheet / month column cannot be found.
     """
     if unit_code not in wb.sheetnames:
         return None
 
-    ws = wb[unit_code]
+    ws     = wb[unit_code]
+    ws_raw = wb_raw[unit_code] if (wb_raw and unit_code in wb_raw.sheetnames) else None
+
     y, m_str = month.split("-")
     target_year, target_month = int(y), int(m_str)
 
@@ -202,29 +217,42 @@ def read_unit_pnl_sheet(wb, unit_code, month):
     if target_col is None:
         return None
 
-    def v(row):
-        """Return raw cell value — None when the cell holds an uncached formula."""
-        return ws.cell(row=row, column=target_col).value
+    def literal_value(row):
+        """Return the cell's float value ONLY if it is a hardcoded literal.
 
-    def fv(row):
-        """Return float if cell has a value, else None (formula not cached)."""
-        raw = v(row)
-        return safe_float(raw) if raw is not None else None
+        Returns None when:
+          • the cell contains a formula  (always compute from raw data)
+          • the cell is empty / uncached (nothing to trust)
+        """
+        if ws_raw is not None:
+            raw_content = ws_raw.cell(row=row, column=target_col).value
+            # Formula cells: skip entirely — we always compute these ourselves
+            if isinstance(raw_content, str) and raw_content.startswith("="):
+                return None
+            # Empty cell in raw workbook
+            if raw_content is None:
+                return None
+            # Literal value — trustworthy
+            return safe_float(raw_content)
+        else:
+            # No raw workbook available — fall back to cached value (may be None)
+            cached = ws.cell(row=row, column=target_col).value
+            return safe_float(cached) if cached is not None else None
 
-    util_raw  = fv(26)
-    reimb_raw = fv(27)
-    mgmt_raw  = fv(30)
-    payout_raw = fv(31)
+    util_raw   = literal_value(26)
+    reimb_raw  = literal_value(27)
+    mgmt_raw   = literal_value(30)   # almost always a formula → None
+    payout_raw = literal_value(31)   # almost always a formula → None
 
     return {
-        "utilities":     abs(util_raw)  if util_raw   is not None else None,
-        "reimbursement": abs(reimb_raw) if reimb_raw  is not None else None,
-        "mgmt_fee":      mgmt_raw,      # negative e.g. -1053.16, or None
-        "owner_payout":  payout_raw,    # positive, or None if formula uncached
+        "utilities":     abs(util_raw)   if util_raw   is not None else None,
+        "reimbursement": abs(reimb_raw)  if reimb_raw  is not None else None,
+        "mgmt_fee":      mgmt_raw,       # negative literal, or None (compute)
+        "owner_payout":  payout_raw,     # positive literal, or None (compute)
     }
 
 
-def load_pnl(wb, unit_code, month, bookings=None, mgmt_pct=0.15):
+def load_pnl(wb, wb_raw, unit_code, month, bookings=None, mgmt_pct=0.15):
     """Compute P&L figures for the SOA.
 
     Revenue & fee totals are derived from the Sales bookings so the
@@ -251,7 +279,7 @@ def load_pnl(wb, unit_code, month, bookings=None, mgmt_pct=0.15):
     rev_net_retained  = round(net_earned - cleaning_retained - tourism_retained, 2)
 
     # ── Primary: read expenses & payout directly from the unit's P&L sheet ──
-    pnl_sheet = read_unit_pnl_sheet(wb, unit_code, month)
+    pnl_sheet = read_unit_pnl_sheet(wb, wb_raw, unit_code, month)
     if pnl_sheet is not None:
         # Use P&L sheet values where the accountant has set them (hardcoded or
         # cached formulas).  When a cell is None (formula never cached in this
@@ -635,8 +663,9 @@ def generate():
         if not unit_codes:
             return jsonify({"error": "No units selected"}), 400
 
-        wb = openpyxl.load_workbook(wb_path, data_only=True)
-        units = load_unit_registry(wb)
+        wb     = openpyxl.load_workbook(wb_path, data_only=True)   # cached values
+        wb_raw = openpyxl.load_workbook(wb_path, data_only=False)  # formula detection
+        units  = load_unit_registry(wb)
 
         zip_buffer = io.BytesIO()
         results = []
@@ -654,7 +683,7 @@ def generate():
                         results.append({"code": code, "status": "skip", "msg": "No bookings"})
                         continue
 
-                    pnl = load_pnl(wb, code, month, bookings, mgmt_pct=unit.get("mgmt_pct", 0.15))
+                    pnl = load_pnl(wb, wb_raw, code, month, bookings, mgmt_pct=unit.get("mgmt_pct", 0.15))
                     if not pnl:
                         results.append({"code": code, "status": "skip", "msg": "No P&L data"})
                         continue
