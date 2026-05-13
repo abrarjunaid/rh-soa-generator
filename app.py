@@ -19,6 +19,7 @@ from pathlib import Path
 
 from flask import Flask, render_template, request, jsonify, send_file
 import openpyxl
+from openpyxl.utils.datetime import from_excel as xl_to_dt
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB max upload
@@ -46,6 +47,24 @@ def month_short(key):
               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
     y, m = key.split("-")
     return f"{months[int(m)]} '{y[2:]}"
+
+
+def normalize_date(value):
+    """Return a datetime from a cell value that may be a datetime, an Excel
+    serial integer/float, or a string — returns None if conversion fails.
+
+    openpyxl usually returns datetime objects for date cells, but some cells
+    (e.g. split-stay rows saved by Hostaway) store the serial number as a
+    plain integer.  This handles both cases so no booking is silently skipped.
+    """
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, (int, float)):
+        try:
+            return xl_to_dt(int(value))
+        except Exception:
+            return None
+    return None
 
 
 def days_in_month(key):
@@ -119,8 +138,8 @@ def get_available_months(wb, units):
         return []
     for row in ws.iter_rows(min_row=header_row + 1, max_row=ws.max_row, values_only=False):
         prop = str(row[3].value or "").strip()
-        sm = row[7].value
-        if prop in unit_codes and isinstance(sm, datetime):
+        sm = normalize_date(row[7].value)
+        if prop in unit_codes and sm is not None:
             months_set.add(month_key(sm))
     return sorted(months_set, reverse=True)
 
@@ -153,7 +172,13 @@ def load_expenses(wb, unit_code, month):
         def in_month(d):
             return isinstance(d, datetime) and d.year == target_year and d.month == target_month
 
-        if (subcat == "Utilities" and
+        # "Service Charges - Apartments" is a building service/maintenance levy
+        # that is charged to the owner alongside utilities.  The P&L row 26
+        # label reads "Utilities & Service Charge" — both subcategories belong
+        # on that line.  We match on svc_month (year+month) rather than an
+        # exact first-of-month date so that invoices dated mid-month are
+        # included (e.g. svc_month = 2026-04-26 is still April 2026).
+        if (subcat in ("Utilities", "Service Charges - Apartments") and
             ac_cat not in ("Apartment Startup Cost", "Business Startup Cost") and
             in_month(svc_month)):
             utilities += amount
@@ -278,12 +303,12 @@ def load_pnl(wb, wb_raw, unit_code, month, bookings=None, mgmt_pct=0.15):
     tourism_retained  = round(sum(b["tourism"]          for b in bookings), 2)
     rev_net_retained  = round(net_earned - cleaning_retained - tourism_retained, 2)
 
-    # Col V ("Service Fee — Host fee Paid By Guest") is included in guest_paid /
-    # remitted for display purposes but the P&L formula explicitly EXCLUDES it
-    # from the management-fee base (AG23).  V is added back to the owner's net
-    # AFTER the mgmt fee is deducted (P&L row 29).  We mirror that here.
-    service_fee_v     = round(sum(b.get("service_fee_v", 0) for b in bookings), 2)
-    rev_mgmt_base     = round(rev_net_retained - service_fee_v, 2)
+    # Col V ("Service Fee — Host fee Paid By Guest") is excluded from guest_paid
+    # so net_earned / rev_net_retained already exclude V — exactly matching
+    # P&L AG23 (the management-fee base).  V is tracked separately and added
+    # back to the owner's net when computing owner_payout (mirrors P&L row 29).
+    service_fee_v = round(sum(b.get("service_fee_v", 0) for b in bookings), 2)
+    rev_mgmt_base = rev_net_retained   # V already excluded; no further subtraction
 
     # ── Primary: read expenses & payout directly from the unit's P&L sheet ──
     pnl_sheet = read_unit_pnl_sheet(wb, wb_raw, unit_code, month)
@@ -359,9 +384,9 @@ def load_bookings(wb, unit_code, month):
     bookings = []
     for row in ws.iter_rows(min_row=header_row + 1, max_row=ws.max_row, values_only=False):
         prop = row[3].value
-        sale_month = row[7].value
+        sale_month = normalize_date(row[7].value)   # handles datetime & Excel serial int
         if (str(prop).strip() != unit_code or
-            not isinstance(sale_month, datetime) or
+            sale_month is None or
             month_key(sale_month) != month):
             continue
 
@@ -374,8 +399,15 @@ def load_bookings(wb, unit_code, month):
         m_to_u      = sum(safe_float(row[c].value) for c in range(12, 21))  # M:U
         service_fee_v = round(safe_float(row[21].value), 2)                  # col V
 
-        # guest_paid still shows the full amount the guest paid (includes V)
-        guest_paid = round(m_to_u + service_fee_v, 2)
+        # guest_paid mirrors P&L row 15 (Total Guest Revenue = M:U only).
+        # Col V is a pass-through that bypasses the mgmt-fee base and is
+        # added directly to the owner's net in P&L row 29; it is NOT part
+        # of the "Booking Revenue" shown in the SOA table or the P&L.
+        guest_paid = round(m_to_u, 2)
+
+        # Skip zero-revenue rows (owner stays, blocked periods, etc.)
+        if guest_paid == 0 and service_fee_v == 0:
+            continue
 
         # Direct values
         host_fee_z = safe_float(row[25].value)       # Z  – Airbnb/Booking.com host fee (negative)
