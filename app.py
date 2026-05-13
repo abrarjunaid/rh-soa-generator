@@ -203,13 +203,24 @@ def read_unit_pnl_sheet(wb, unit_code, month):
         return None
 
     def v(row):
-        return safe_float(ws.cell(row=row, column=target_col).value)
+        """Return raw cell value — None when the cell holds an uncached formula."""
+        return ws.cell(row=row, column=target_col).value
+
+    def fv(row):
+        """Return float if cell has a value, else None (formula not cached)."""
+        raw = v(row)
+        return safe_float(raw) if raw is not None else None
+
+    util_raw  = fv(26)
+    reimb_raw = fv(27)
+    mgmt_raw  = fv(30)
+    payout_raw = fv(31)
 
     return {
-        "utilities":     abs(v(26)),   # stored negative in sheet
-        "reimbursement": abs(v(27)),   # stored negative in sheet
-        "mgmt_fee":      v(30),        # negative  e.g. -1053.16
-        "owner_payout":  v(31),        # positive (can be negative if owner owes)
+        "utilities":     abs(util_raw)  if util_raw   is not None else None,
+        "reimbursement": abs(reimb_raw) if reimb_raw  is not None else None,
+        "mgmt_fee":      mgmt_raw,      # negative e.g. -1053.16, or None
+        "owner_payout":  payout_raw,    # positive, or None if formula uncached
     }
 
 
@@ -241,11 +252,37 @@ def load_pnl(wb, unit_code, month, bookings=None, mgmt_pct=0.15):
 
     # ── Primary: read expenses & payout directly from the unit's P&L sheet ──
     pnl_sheet = read_unit_pnl_sheet(wb, unit_code, month)
-    if pnl_sheet:
-        utilities     = pnl_sheet["utilities"]
-        reimbursement = pnl_sheet["reimbursement"]
-        mgmt_fee      = abs(pnl_sheet["mgmt_fee"])
-        owner_payout  = pnl_sheet["owner_payout"]
+    if pnl_sheet is not None:
+        # Use P&L sheet values where the accountant has set them (hardcoded or
+        # cached formulas).  When a cell is None (formula never cached in this
+        # save), fall back gracefully so the SOA still shows correct numbers.
+        exp_util, exp_reimb = None, None   # load lazily if needed
+
+        if pnl_sheet["utilities"] is not None:
+            utilities = pnl_sheet["utilities"]
+        else:
+            exp_util, exp_reimb = load_expenses(wb, unit_code, month)
+            utilities = exp_util
+
+        if pnl_sheet["reimbursement"] is not None:
+            reimbursement = pnl_sheet["reimbursement"]
+        else:
+            if exp_reimb is None:
+                exp_util, exp_reimb = load_expenses(wb, unit_code, month)
+            reimbursement = exp_reimb
+
+        # mgmt_fee: use P&L if cached and non-zero, otherwise compute
+        if pnl_sheet["mgmt_fee"] is not None and abs(pnl_sheet["mgmt_fee"]) > 0:
+            mgmt_fee = abs(pnl_sheet["mgmt_fee"])
+        else:
+            mgmt_fee = round(rev_net_retained * mgmt_pct, 2)
+
+        # owner_payout: use P&L if cached, otherwise derive from the other values
+        if pnl_sheet["owner_payout"] is not None:
+            owner_payout = pnl_sheet["owner_payout"]
+        else:
+            net_b4_mgmt  = round(rev_net_retained - utilities - reimbursement, 2)
+            owner_payout = round(net_b4_mgmt - mgmt_fee, 2)
     else:
         # ── Fallback: compute from Expenses sheet ────────────────────────────
         utilities, reimbursement = load_expenses(wb, unit_code, month)
