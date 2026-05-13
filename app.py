@@ -278,6 +278,13 @@ def load_pnl(wb, wb_raw, unit_code, month, bookings=None, mgmt_pct=0.15):
     tourism_retained  = round(sum(b["tourism"]          for b in bookings), 2)
     rev_net_retained  = round(net_earned - cleaning_retained - tourism_retained, 2)
 
+    # Col V ("Service Fee — Host fee Paid By Guest") is included in guest_paid /
+    # remitted for display purposes but the P&L formula explicitly EXCLUDES it
+    # from the management-fee base (AG23).  V is added back to the owner's net
+    # AFTER the mgmt fee is deducted (P&L row 29).  We mirror that here.
+    service_fee_v     = round(sum(b.get("service_fee_v", 0) for b in bookings), 2)
+    rev_mgmt_base     = round(rev_net_retained - service_fee_v, 2)
+
     # ── Primary: read expenses & payout directly from the unit's P&L sheet ──
     pnl_sheet = read_unit_pnl_sheet(wb, wb_raw, unit_code, month)
     if pnl_sheet is not None:
@@ -299,23 +306,27 @@ def load_pnl(wb, wb_raw, unit_code, month, bookings=None, mgmt_pct=0.15):
                 exp_util, exp_reimb = load_expenses(wb, unit_code, month)
             reimbursement = exp_reimb
 
-        # mgmt_fee: use P&L if cached and non-zero, otherwise compute
+        # mgmt_fee: 15% of rev_mgmt_base (which excludes col-V pass-through).
+        # Use P&L literal only if the accountant hardcoded it; formula cells
+        # are always None here so we always compute.
         if pnl_sheet["mgmt_fee"] is not None and abs(pnl_sheet["mgmt_fee"]) > 0:
             mgmt_fee = abs(pnl_sheet["mgmt_fee"])
         else:
-            mgmt_fee = round(rev_net_retained * mgmt_pct, 2)
+            mgmt_fee = round(rev_mgmt_base * mgmt_pct, 2)
 
-        # owner_payout: use P&L if cached, otherwise derive from the other values
+        # owner_payout: use P&L literal if available, else compute.
+        # Formula: (rev_mgmt_base − expenses + service_fee_v) − mgmt_fee
+        # This mirrors P&L row 29 which adds Sales!V AFTER the mgmt-fee base.
         if pnl_sheet["owner_payout"] is not None:
             owner_payout = pnl_sheet["owner_payout"]
         else:
-            net_b4_mgmt  = round(rev_net_retained - utilities - reimbursement, 2)
+            net_b4_mgmt  = round(rev_mgmt_base - utilities - reimbursement + service_fee_v, 2)
             owner_payout = round(net_b4_mgmt - mgmt_fee, 2)
     else:
         # ── Fallback: compute from Expenses sheet ────────────────────────────
         utilities, reimbursement = load_expenses(wb, unit_code, month)
-        mgmt_fee     = round(rev_net_retained * mgmt_pct, 2)
-        net_b4_mgmt  = round(rev_net_retained - (utilities + reimbursement), 2)
+        mgmt_fee     = round(rev_mgmt_base * mgmt_pct, 2)
+        net_b4_mgmt  = round(rev_mgmt_base - (utilities + reimbursement) + service_fee_v, 2)
         owner_payout = round(net_b4_mgmt - mgmt_fee, 2)
 
     total_owner_expenses = round(utilities + reimbursement, 2)
@@ -354,12 +365,17 @@ def load_bookings(wb, unit_code, month):
             month_key(sale_month) != month):
             continue
 
-        # Raw input columns (M through V + AK)
-        m_to_v = sum(safe_float(row[c].value) for c in range(12, 22))
-        ak = safe_float(row[36].value) if len(row) > 36 else 0
+        # Revenue columns M:U (accommodation, cleaning, community, tourism,
+        # resort fee, credit card fee, lodging tax, VAT, discount).
+        # Col V ("Service Fee — Host fee Paid By Guest") is tracked separately:
+        # it is included in guest_paid for display but EXCLUDED from the
+        # management-fee base, mirroring the P&L formula (rows 5-14 sum M:U+AN,
+        # V is only added back in row 29 after the mgmt fee is calculated).
+        m_to_u      = sum(safe_float(row[c].value) for c in range(12, 21))  # M:U
+        service_fee_v = round(safe_float(row[21].value), 2)                  # col V
 
-        # Computed: GuestPaid = SUM(M:V) + AK
-        guest_paid = round(m_to_v + ak, 2)
+        # guest_paid still shows the full amount the guest paid (includes V)
+        guest_paid = round(m_to_u + service_fee_v, 2)
 
         # Direct values
         host_fee_z = safe_float(row[25].value)       # Z  – Airbnb/Booking.com host fee (negative)
@@ -384,6 +400,7 @@ def load_bookings(wb, unit_code, month):
             "host_fee_total": host_fee_total,
             "payment_charges": pg_fees_total,
             "remitted": remitted,
+            "service_fee_v": service_fee_v,   # col V pass-through (excluded from mgmt base)
         })
     return bookings
 
