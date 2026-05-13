@@ -57,6 +57,7 @@
   .hidden { display: none !important; }
   .change-btn { background: none; border: none; color: rgba(255,255,255,0.3); cursor: pointer; font-size: 13px; font-family: inherit; margin-left: auto; }
   .change-btn:hover { color: rgba(255,255,255,0.6); }
+  .wb-warning { background: rgba(201,148,0,0.12); border: 1px solid rgba(201,148,0,0.45); border-radius: 8px; padding: 12px 16px; color: #e8c84a; font-size: 12.5px; display: flex; gap: 10px; align-items: flex-start; margin-bottom: 16px; line-height: 1.55; }
 </style>
 </head>
 <body>
@@ -75,6 +76,7 @@
 
   <!-- Step 2: Configure -->
   <div id="step-config" class="card hidden">
+    <div id="wb-warning" class="wb-warning hidden"><span style="flex-shrink:0">⚠️</span><span id="wb-warning-text"></span></div>
     <div class="row">
       <div class="field">
         <span class="label">Workbook</span>
@@ -149,6 +151,16 @@ async function uploadFile(file) {
     state.months = data.months;
 
     document.getElementById('file-info').textContent = `${data.units.length} units · ${data.months.length} months`;
+
+    // Show recalculation warning if P&L formula cells appear uncached
+    const warnEl = document.getElementById('wb-warning');
+    const warnText = document.getElementById('wb-warning-text');
+    if (data.warning) {
+      warnText.textContent = data.warning;
+      warnEl.classList.remove('hidden');
+    } else {
+      warnEl.classList.add('hidden');
+    }
     const sel = document.getElementById('month-select');
     sel.innerHTML = data.months.map(m => {
       const [y, mn] = m.split('-');

@@ -196,27 +196,32 @@ def read_unit_pnl_sheet(wb, wb_raw, unit_code, month):
     The workbook contains one sheet per unit (e.g. "AC 1303") with a
     standardised row layout.
 
-    Strategy — formula vs literal detection
-    ----------------------------------------
+    Strategy — three-tier cell reading
+    ------------------------------------
     wb       is loaded with data_only=True  → gives cached formula results
     wb_raw   is loaded with data_only=False → gives the actual cell content
-             (a formula string like "=SUMIFS(...)" or a literal number)
+             (formula string like "=SUMIFS(...)" or literal number)
 
-    For each key cell we check wb_raw first:
-      • If the cell contains a formula (value starts with "=")
-        → return None so load_pnl will compute the value from raw booking /
-          expense data.  This makes the SOA immune to the workbook being
-          saved without Excel recalculating.
-      • If the cell contains a literal value (hardcoded by the accountant)
-        → return that value.  The accountant's intentional override is
-          honoured regardless of how the workbook was saved.
+    For each key cell:
+      • Literal value (hardcoded by accountant)
+        → returned directly — accountant's intentional override is honoured.
+      • Formula with a cached result (workbook saved after recalculating)
+        → cached value returned — gives exact P&L match.
+      • Formula with NO cached result (workbook saved without recalculating)
+        → returns None — load_pnl falls back to computing from raw data.
+      • Empty cell → returns None.
+
+    This makes the SOA the source of truth from the P&L when the workbook
+    is properly saved, while still producing reasonable numbers when the
+    accountant forgets to recalculate before saving.
 
     Row layout (1-indexed):
       3  = month header dates (first-of-month)
-      26 = Less: Utilities & Service Charge  (negative literal expected)
-      27 = Less: Reimbursement Cost          (negative literal or formula)
-      30 = Less: Management Fee              (formula → always None here)
-      31 = Owner Payout                      (formula → always None here)
+      23 = Rev Net of Retained Fees (management-fee base, formula)
+      26 = Less: Utilities & Service Charge  (negative literal)
+      27 = Less: Reimbursement Cost          (literal or formula)
+      30 = Less: Management Fee              (formula)
+      31 = Owner Payout                      (formula)
 
     Returns a dict or None if the sheet / month column cannot be found.
     """
@@ -242,38 +247,42 @@ def read_unit_pnl_sheet(wb, wb_raw, unit_code, month):
     if target_col is None:
         return None
 
-    def literal_value(row):
-        """Return the cell's float value ONLY if it is a hardcoded literal.
+    def cell_value(row_num):
+        """Return the cell's value, using cached formula results when available.
 
-        Returns None when:
-          • the cell contains a formula  (always compute from raw data)
-          • the cell is empty / uncached (nothing to trust)
+        • Literal value         → returned directly (accountant's override)
+        • Formula + cached      → cached result returned (exact P&L match)
+        • Formula + not cached  → None (workbook not recalculated before save;
+                                  load_pnl falls back to computing from Sales)
+        • Empty cell            → None
         """
         if ws_raw is not None:
-            raw_content = ws_raw.cell(row=row, column=target_col).value
-            # Formula cells: skip entirely — we always compute these ourselves
-            if isinstance(raw_content, str) and raw_content.startswith("="):
+            raw = ws_raw.cell(row=row_num, column=target_col).value
+            if raw is None:
                 return None
-            # Empty cell in raw workbook
-            if raw_content is None:
-                return None
-            # Literal value — trustworthy
-            return safe_float(raw_content)
+            if isinstance(raw, str) and raw.startswith("="):
+                # Formula — use the cached result from data_only=True workbook
+                cached = ws.cell(row=row_num, column=target_col).value
+                return safe_float(cached) if cached is not None else None
+            # Literal value — trust it directly
+            return safe_float(raw)
         else:
-            # No raw workbook available — fall back to cached value (may be None)
-            cached = ws.cell(row=row, column=target_col).value
+            # No raw workbook — use cached value only (may be None)
+            cached = ws.cell(row=row_num, column=target_col).value
             return safe_float(cached) if cached is not None else None
 
-    util_raw   = literal_value(26)
-    reimb_raw  = literal_value(27)
-    mgmt_raw   = literal_value(30)   # almost always a formula → None
-    payout_raw = literal_value(31)   # almost always a formula → None
+    rev_base_raw = cell_value(23)   # row 23: Rev net of retained fees (mgmt fee base)
+    util_raw     = cell_value(26)   # row 26: Less: Utilities & Service Charge
+    reimb_raw    = cell_value(27)   # row 27: Less: Reimbursement Cost
+    mgmt_raw     = cell_value(30)   # row 30: Less: Management Fee
+    payout_raw   = cell_value(31)   # row 31: Owner Payout
 
     return {
+        "rev_mgmt_base": rev_base_raw,                                     # positive, or None
         "utilities":     abs(util_raw)   if util_raw   is not None else None,
         "reimbursement": abs(reimb_raw)  if reimb_raw  is not None else None,
-        "mgmt_fee":      mgmt_raw,       # negative literal, or None (compute)
-        "owner_payout":  payout_raw,     # positive literal, or None (compute)
+        "mgmt_fee":      mgmt_raw,       # may be negative (P&L sign), or None
+        "owner_payout":  payout_raw,     # positive, or None
     }
 
 
@@ -313,10 +322,17 @@ def load_pnl(wb, wb_raw, unit_code, month, bookings=None, mgmt_pct=0.15):
     # ── Primary: read expenses & payout directly from the unit's P&L sheet ──
     pnl_sheet = read_unit_pnl_sheet(wb, wb_raw, unit_code, month)
     if pnl_sheet is not None:
-        # Use P&L sheet values where the accountant has set them (hardcoded or
-        # cached formulas).  When a cell is None (formula never cached in this
-        # save), fall back gracefully so the SOA still shows correct numbers.
+        # Use P&L sheet values when available (cached formula or literal).
+        # When a cell returns None (formula uncached — workbook saved without
+        # recalculating), fall back gracefully so the SOA still produces numbers.
         exp_util, exp_reimb = None, None   # load lazily if needed
+
+        # P&L row 23: Rev net of retained fees — the exact mgmt-fee base used
+        # by the accountant's SUMIFS formula.  Override our booking-derived
+        # figure when the P&L cached value is available.
+        if pnl_sheet.get("rev_mgmt_base") is not None:
+            rev_mgmt_base = pnl_sheet["rev_mgmt_base"]
+        # (else rev_mgmt_base stays as rev_net_retained computed from bookings)
 
         if pnl_sheet["utilities"] is not None:
             utilities = pnl_sheet["utilities"]
@@ -331,17 +347,16 @@ def load_pnl(wb, wb_raw, unit_code, month, bookings=None, mgmt_pct=0.15):
                 exp_util, exp_reimb = load_expenses(wb, unit_code, month)
             reimbursement = exp_reimb
 
-        # mgmt_fee: 15% of rev_mgmt_base (which excludes col-V pass-through).
-        # Use P&L literal only if the accountant hardcoded it; formula cells
-        # are always None here so we always compute.
+        # mgmt_fee: read from P&L row 30 (cached formula = exact match).
+        # Falls back to 15% × rev_mgmt_base only when P&L is not cached.
         if pnl_sheet["mgmt_fee"] is not None and abs(pnl_sheet["mgmt_fee"]) > 0:
             mgmt_fee = abs(pnl_sheet["mgmt_fee"])
         else:
             mgmt_fee = round(rev_mgmt_base * mgmt_pct, 2)
 
-        # owner_payout: use P&L literal if available, else compute.
-        # Formula: (rev_mgmt_base − expenses + service_fee_v) − mgmt_fee
-        # This mirrors P&L row 29 which adds Sales!V AFTER the mgmt-fee base.
+        # owner_payout: read from P&L row 31 (cached formula = exact match).
+        # Falls back to formula: (rev_mgmt_base − expenses + service_fee_v) − mgmt_fee
+        # which mirrors P&L row 29 adding Sales!V after the mgmt-fee deduction.
         if pnl_sheet["owner_payout"] is not None:
             owner_payout = pnl_sheet["owner_payout"]
         else:
@@ -648,6 +663,60 @@ def html_to_pdf(html_content):
                     pass
 
 
+def check_pnl_cached(wb, wb_raw, units):
+    """Spot-check P&L formula cells to detect workbooks saved without recalculating.
+
+    Samples the first unit that has a P&L sheet and any date header in row 3.
+    Checks rows 30 and 31 (Management Fee and Owner Payout) — always formulas.
+
+    Returns a warning string when formulas appear uncached, otherwise None.
+    """
+    if wb_raw is None:
+        return None
+
+    for unit in units[:6]:
+        code = unit["code"]
+        if code not in wb.sheetnames or code not in wb_raw.sheetnames:
+            continue
+
+        ws     = wb[code]
+        ws_raw = wb_raw[code]
+
+        # Find any date column in row 3
+        target_col = None
+        for col in range(2, min(ws.max_column + 1, 60)):
+            val = ws.cell(row=3, column=col).value
+            if isinstance(val, datetime):
+                target_col = col
+                break
+
+        if target_col is None:
+            continue
+
+        # Check rows 30 and 31 — they should always be formulas in a live workbook
+        uncached = 0
+        for row_num in (30, 31):
+            raw = ws_raw.cell(row=row_num, column=target_col).value
+            if isinstance(raw, str) and raw.startswith("="):
+                if ws.cell(row=row_num, column=target_col).value is None:
+                    uncached += 1
+
+        if uncached > 0:
+            return (
+                "⚠️ Workbook saved without recalculating — key P&L formula cells "
+                "have no cached values. Management fee and owner payout will be "
+                "estimated from raw booking data and may differ slightly from the P&L. "
+                "For exact figures: open the file in Excel, press Ctrl+Shift+F9, "
+                "save, then re-upload."
+            )
+
+        # Found a unit with cached formulas — workbook is fine
+        return None
+
+    # No unit P&L sheets found — no warning needed
+    return None
+
+
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -671,20 +740,25 @@ def upload():
         if not file.filename.endswith((".xlsx", ".xls")):
             return jsonify({"error": "Please upload an .xlsx file"}), 400
 
-        wb = openpyxl.load_workbook(io.BytesIO(file.read()), data_only=True)
-        units = load_unit_registry(wb)
+        raw_bytes = file.read()
+        wb     = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True)
+        wb_raw = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=False)
+        units  = load_unit_registry(wb)
         months = get_available_months(wb, units)
 
+        # Check whether P&L formula cells have cached values
+        warning = check_pnl_cached(wb, wb_raw, units)
+
         # Save workbook to temp file
-        file.seek(0)
         tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
-        file.save(tmp.name)
+        tmp.write(raw_bytes)
         tmp.close()
 
         return jsonify({
             "wb_path": tmp.name,
             "units": units,
             "months": months,
+            "warning": warning,
         })
     except Exception as e:
         return jsonify({"error": f"Upload failed: {str(e)}"}), 500
